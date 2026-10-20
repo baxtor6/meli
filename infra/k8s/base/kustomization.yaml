@@ -1,0 +1,24 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Recursos base compartidos por todos los entornos. Los overlays
+# (overlays/staging, overlays/production) parchean imagen, replicas,
+# dominio y ARNs especificos de cada entorno.
+resources:
+  - serviceaccount.yaml
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml
+  - hpa.yaml
+  - pdb.yaml
+
+labels:
+  - pairs:
+      app.kubernetes.io/name: seller-dashboard-api
+      app.kubernetes.io/part-of: seller-dashboard
+    includeSelectors: false
+
+images:
+  - name: seller-dashboard-api
+    newName: ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/seller-dashboard-api
+    newTag: latest

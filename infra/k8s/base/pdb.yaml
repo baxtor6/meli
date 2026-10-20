@@ -1,0 +1,13 @@
+# PodDisruptionBudget: durante disrupciones voluntarias (drain de nodos,
+# upgrades, rolling restarts) Kubernetes mantiene al menos 4 pods vivos,
+# evitando que un mantenimiento deje el API sin capacidad suficiente.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: seller-dashboard-api
+  namespace: default
+spec:
+  minAvailable: 4
+  selector:
+    matchLabels:
+      app: seller-dashboard-api

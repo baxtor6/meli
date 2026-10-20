@@ -1,0 +1,25 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: default
+
+resources:
+  - ../../base
+
+# Produccion usa los valores de la base (6-60 replicas, PDB minAvailable 4).
+# Solo se fija el host publico del Ingress.
+patches:
+  - target:
+      kind: Ingress
+      name: seller-dashboard-api
+    patch: |-
+      - op: replace
+        path: /spec/rules/0/host
+        value: api.sellerdashboard.io
+
+# El pipeline ejecuta aqui (etapa canary via Argo Rollouts):
+#   kustomize edit set image seller-dashboard-api=*:<SHA>
+images:
+  - name: seller-dashboard-api
+    newName: ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/seller-dashboard-api
+    newTag: latest

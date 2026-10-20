@@ -1,0 +1,104 @@
+# Deployment del API Spring Boot.
+# - replicas: lo gestiona el HPA (ver hpa.yaml); el valor aqui es solo el
+#   arranque inicial antes de que el HPA tome control.
+# - probes contra /actuator/health (ya permitAll en el SecurityConfig).
+# - anti-affinity por hostname + topologySpreadConstraints por AZ para que
+#   las replicas no caigan todas en el mismo nodo/zona.
+# - resources: requests/limits para que el HPA pueda escalar por CPU y para
+#   que el scheduler respete los limites de los nodos.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: seller-dashboard-api
+  namespace: default
+  labels:
+    app: seller-dashboard-api
+spec:
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: seller-dashboard-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: seller-dashboard-api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/actuator/prometheus"
+        prometheus.io/port: "8080"
+    spec:
+      serviceAccountName: seller-dashboard-api
+      # Repartir replicas entre nodos y zonas de disponibilidad.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: seller-dashboard-api
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: seller-dashboard-api
+      containers:
+        - name: api
+          # Nombre logico de imagen; kustomize lo reescribe al repo ECR real
+          # (ver images: en kustomization.yaml). El tag inmutable (SHA del
+          # commit) lo setea el pipeline via `kustomize edit set image`.
+          image: seller-dashboard-api:latest
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: SPRING_PROFILES_ACTIVE
+              value: "production"
+            # Credenciales de DB inyectadas desde Secrets Manager via el
+            # Secrets Store CSI driver (montado como secreto de K8s). El
+            # Secret `seller-dashboard-db` lo crea ese driver, no kubectl.
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: seller-dashboard-db
+                  key: password
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "768Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          startupProbe:
+            httpGet:
+              path: /actuator/health
+              port: http
+            failureThreshold: 30
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /actuator/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /actuator/health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      terminationGracePeriodSeconds: 45

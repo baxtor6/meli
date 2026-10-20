@@ -1,0 +1,21 @@
+# ---- Terraform ----
+**/.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+*.tfvars
+
+# ---- Node / frontend ----
+node_modules/
+dist/
+*.local
+
+# ---- Java / backend ----
+.gradle/
+build/
+*.jar
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+*.log

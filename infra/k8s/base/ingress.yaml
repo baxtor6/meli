@@ -1,0 +1,62 @@
+# Ingress gestionado por el AWS Load Balancer Controller (OPCION A: el
+# controller es la UNICA fuente de verdad del ALB; Terraform no crea el ALB).
+#
+# A partir de estas annotations el controller PROVISIONA el ALB completo:
+#   - internet-facing, en las subnets publicas (tag kubernetes.io/role/elb)
+#   - target-type ip -> registra/desregistra los pods directamente (ideal con HPA)
+#   - listener 443 + redirect de 80, con el certificado ACM
+#   - WAF regional asociado
+#   - access logs al bucket S3 creado por Terraform (s3_alb_logs.tf)
+# y ExternalDNS crea el registro Route53 var.domain_name -> ALB.
+#
+# Los valores REPLACE/ACCOUNT_ID los inyecta el pipeline por entorno a partir
+# de los outputs de Terraform (certificate ARN, waf_alb_acl_arn, bucket, etc.).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: seller-dashboard-api
+  namespace: default
+  annotations:
+    # --- Creacion del ALB ---
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443},{"HTTP":80}]'
+    alb.ingress.kubernetes.io/ssl-redirect: '443'
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+    # --- Health check (coincide con el actuator del backend) ---
+    # El ALB recibe el path YA SIN el prefijo /api: CloudFront lo quita con una
+    # Function en el behavior /api/* (ver infra/terraform/cloudfront.tf). Por eso
+    # el backend y el Ingress siguen trabajando en "/..." (ej. /actuator/health).
+    alb.ingress.kubernetes.io/healthcheck-path: /actuator/health
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: '15'
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: '5'
+    alb.ingress.kubernetes.io/success-codes: '200'
+    # --- Certificado ACM (output: salida de acm.tf, resuelto por el pipeline) ---
+    alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:us-east-1:ACCOUNT_ID:certificate/REPLACE"
+    # --- WAF regional (output: waf_alb_acl_arn) ---
+    alb.ingress.kubernetes.io/wafv2-acl-arn: "arn:aws:wafv2:us-east-1:ACCOUNT_ID:regional/webacl/seller-dashboard-alb-waf/REPLACE"
+    # --- Access logs al bucket S3 gestionado por Terraform ---
+    alb.ingress.kubernetes.io/load-balancer-attributes: >-
+      access_logs.s3.enabled=true,
+      access_logs.s3.bucket=seller-dashboard-alb-logs,
+      access_logs.s3.prefix=alb,
+      routing.http2.enabled=true,
+      deletion_protection.enabled=true
+    # --- Security Group del ALB (output: alb_security_group_id) ---
+    alb.ingress.kubernetes.io/security-groups: "sg-REPLACE"
+    alb.ingress.kubernetes.io/manage-backend-security-group-rules: "true"
+    # --- Hostname estable publicado por ExternalDNS (= var.domain_name) ---
+    external-dns.alpha.kubernetes.io/hostname: origin.seller-dashboard.example.com
+spec:
+  ingressClassName: alb
+  rules:
+    - host: origin.seller-dashboard.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: seller-dashboard-api
+                port:
+                  number: 80

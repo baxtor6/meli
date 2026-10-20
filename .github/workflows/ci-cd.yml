@@ -1,0 +1,267 @@
+# ============================================================================
+# Pipeline CI/CD (ilustrativo) — monorepo con despliegue selectivo por carpeta
+# ============================================================================
+# Este workflow es un EJEMPLO de referencia para GitHub Actions.
+# No esta pensado para ejecutarse tal cual contra una cuenta AWS real: faltan
+# secrets, roles IAM y nombres de recursos reales (ver infra/architecture.md).
+#
+# Ubicacion: .github/workflows/ en la raiz del repo (unico lugar desde donde
+# GitHub Actions descubre y ejecuta workflows).
+#
+# DESPLIEGUE SELECTIVO: el job `changes` detecta que carpeta se modifico y solo
+# se construye/despliega lo que cambio:
+#   - cambios en backend/  -> build imagen + deploy a EKS
+#   - cambios en frontend/ -> build estatico + deploy a S3/CloudFront
+#   - cambios en infra/    -> validacion de IaC (terraform/kustomize)
+# ============================================================================
+
+name: CI/CD
+
+on:
+  # PR contra main en dos momentos:
+  #   - opened/synchronize/reopened -> validacion (build, tests) mientras el PR
+  #     esta abierto; NO despliega (feedback antes del merge).
+  #   - closed -> el deploy solo corre si ademas fue MERGEADO
+  #     (se filtra con github.event.pull_request.merged == true en los jobs).
+  # No se usa `push: main`: el unico camino a produccion es un PR mergeado
+  # (rama main protegida, sin commits directos).
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  # Repositorio ECR y nombres de K8s: coinciden con los manifiestos de
+  # infra/k8s (Deployment "seller-dashboard-api", contenedor "api").
+  ECR_REPOSITORY: seller-dashboard-api
+  EKS_CLUSTER_NAME: seller-dashboard-eks
+
+jobs:
+
+  # --------------------------------------------------------------------------
+  # Etapa 0: Detectar que cambio (path filters)
+  # --------------------------------------------------------------------------
+  # Publica tres outputs booleanos (backend/frontend/infra) que el resto de los
+  # jobs usan en su `if` para decidir si corren. Asi un cambio solo en frontend/
+  # no dispara el build ni el deploy del backend, y viceversa.
+  changes:
+    name: Detectar cambios
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.merged == true || github.event.action != 'closed'
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+      infra: ${{ steps.filter.outputs.infra }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            backend:
+              - 'backend/**'
+            frontend:
+              - 'frontend/**'
+            infra:
+              - 'infra/**'
+
+  # ==========================================================================
+  # BACKEND  (solo si cambio backend/)
+  # ==========================================================================
+
+  # Etapa 1 (backend): Build & Unit Tests
+  backend-build-test:
+    name: Backend · Build & Test
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+      - name: Build & test
+        working-directory: backend
+        run: gradle build test
+
+  # Etapa 2 (backend): Build de imagen + push a ECR (solo al mergear)
+  backend-image:
+    name: Backend · Build, Scan & Push Image
+    runs-on: ubuntu-latest
+    needs: [changes, backend-build-test]
+    if: needs.changes.outputs.backend == 'true' && github.event.pull_request.merged == true
+    outputs:
+      image_tag: ${{ steps.vars.outputs.sha_short }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set short SHA as tag
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build image (multi-stage)
+        run: |
+          docker build \
+            -t ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.vars.outputs.sha_short }} \
+            -f backend/Dockerfile backend
+      - name: Push image to Amazon ECR
+        run: |
+          docker push ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.vars.outputs.sha_short }}
+      # ECR con enhanced scanning (Amazon Inspector) escanea al subir la imagen.
+      - name: Esperar y evaluar el escaneo de Amazon ECR
+        run: |
+          aws ecr wait image-scan-complete \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --image-id imageTag=${{ steps.vars.outputs.sha_short }}
+          FINDINGS=$(aws ecr describe-image-scan-findings \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --image-id imageTag=${{ steps.vars.outputs.sha_short }} \
+            --query 'imageScanFindingsSummary.findingSeverityCounts' --output json)
+          echo "Hallazgos por severidad: $FINDINGS"
+          CRIT=$(echo "$FINDINGS" | jq -r '.CRITICAL // 0')
+          HIGH=$(echo "$FINDINGS" | jq -r '.HIGH // 0')
+          if [ "$CRIT" -gt 0 ] || [ "$HIGH" -gt 0 ]; then
+            echo "::error::Escaneo de ECR encontro $CRIT CRITICAL y $HIGH HIGH"
+            exit 1
+          fi
+
+  # Etapa 3 (backend): Deploy a EKS con kubectl + rolling update
+  backend-deploy:
+    name: Backend · Deploy a EKS
+    runs-on: ubuntu-latest
+    needs: [changes, backend-image]
+    if: needs.changes.outputs.backend == 'true' && github.event.pull_request.merged == true
+    environment: production  # requiere aprobacion manual (reviewers) en GitHub
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Actualizar kubeconfig (Amazon EKS)
+        run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+      # Rolling update nativo del Deployment (maxSurge/maxUnavailable en el
+      # manifiesto). kubectl bloquea hasta terminar; si falla, rollout undo.
+      - name: Desplegar overlay de production
+        run: |
+          cd infra/k8s/overlays/production
+          kubectl apply -k .
+          kubectl set image deployment/seller-dashboard-api \
+            api=$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ needs.backend-image.outputs.image_tag }}
+      - name: Verificar rollout y revertir si falla
+        run: |
+          if ! kubectl rollout status deployment/seller-dashboard-api --timeout=5m; then
+            echo "::error::Rollout fallido, revirtiendo"
+            kubectl rollout undo deployment/seller-dashboard-api
+            exit 1
+          fi
+      - name: Notificar resultado via Amazon SNS
+        if: always()
+        run: |
+          aws sns publish \
+            --topic-arn ${{ secrets.SNS_DEPLOY_TOPIC_ARN }} \
+            --subject "Deploy backend: ${{ job.status }}" \
+            --message "backend - deploy ${{ job.status }} - imagen ${{ needs.backend-image.outputs.image_tag }}"
+
+  # ==========================================================================
+  # FRONTEND  (solo si cambio frontend/)
+  # ==========================================================================
+
+  # Etapa 1 (frontend): Build & Unit Tests
+  frontend-build-test:
+    name: Frontend · Build & Test
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install, build & test
+        working-directory: frontend
+        run: |
+          npm install
+          npm run build
+          npm test
+      - name: Subir artefacto del build
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+
+  # Etapa 2 (frontend): Deploy estatico a S3 + invalidacion de CloudFront
+  # (solo al mergear). La SPA se sirve como estatico desde el edge.
+  frontend-deploy:
+    name: Frontend · Deploy a S3/CloudFront
+    runs-on: ubuntu-latest
+    needs: [changes, frontend-build-test]
+    if: needs.changes.outputs.frontend == 'true' && github.event.pull_request.merged == true
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Build de produccion
+        working-directory: frontend
+        run: |
+          npm install
+          npm run build
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Sync a S3
+        run: aws s3 sync frontend/dist s3://${{ secrets.FRONTEND_BUCKET }} --delete
+      - name: Invalidar cache de CloudFront
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*"
+      - name: Notificar resultado via Amazon SNS
+        if: always()
+        run: |
+          aws sns publish \
+            --topic-arn ${{ secrets.SNS_DEPLOY_TOPIC_ARN }} \
+            --subject "Deploy frontend: ${{ job.status }}" \
+            --message "frontend - deploy ${{ job.status }}"
+
+  # ==========================================================================
+  # INFRA  (solo si cambio infra/)
+  # ==========================================================================
+
+  # Validacion estatica de IaC. No despliega infraestructura automaticamente:
+  # un `terraform apply` sobre recursos vivos requiere revision y aprobacion
+  # fuera de banda (ver infra/architecture.md y README).
+  infra-validate:
+    name: Infra · Validar IaC
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.infra == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform fmt + validate
+        working-directory: infra/terraform
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false
+          terraform validate
+      - name: Validar overlays de Kustomize
+        run: |
+          kubectl kustomize infra/k8s/overlays/staging > /dev/null
+          kubectl kustomize infra/k8s/overlays/production > /dev/null

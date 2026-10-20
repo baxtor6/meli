@@ -1,0 +1,18 @@
+# Service ClusterIP. El Ingress (AWS Load Balancer Controller) crea un Target
+# Group tipo "ip" que apunta directamente a los pods, pero el Service sigue
+# siendo util para descubrimiento interno y para el target-type del Ingress.
+apiVersion: v1
+kind: Service
+metadata:
+  name: seller-dashboard-api
+  namespace: default
+  labels:
+    app: seller-dashboard-api
+spec:
+  type: ClusterIP
+  selector:
+    app: seller-dashboard-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
